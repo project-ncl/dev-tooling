@@ -1,0 +1,12 @@
+name: Validate GitHub Actions Workflows
+permissions: {}
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/*.yml'
+
+jobs:
+
+  validate:
+    uses: project-ncl/shared-github-actions/.github/workflows/validate-gh-action.yml@461b242bf215856b94e7b40f1ecfa06f7ebb1b45 # v0.0.26
