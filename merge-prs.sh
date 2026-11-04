@@ -61,7 +61,7 @@ EOF
 }
 
 # Colours are set up by init_colors after option parsing; empty until then.
-C_RESET="" C_DIM="" C_RED="" C_GREEN="" C_YELLOW="" C_CYAN="" C_BOLD_GREEN="" C_BOLD_RED=""
+C_RESET="" C_DIM="" C_GREEN="" C_YELLOW="" C_CYAN="" C_BOLD_RED=""
 
 init_colors() {
     if [[ "$COLOR" == "auto" ]]; then
@@ -69,9 +69,8 @@ init_colors() {
     fi
     [[ "$COLOR" == "always" ]] || return 0
     C_RESET=$'\033[0m'      C_DIM=$'\033[2m'
-    C_RED=$'\033[31m'       C_GREEN=$'\033[32m'
-    C_YELLOW=$'\033[33m'    C_CYAN=$'\033[36m'
-    C_BOLD_GREEN=$'\033[1;32m' C_BOLD_RED=$'\033[1;31m'
+    C_GREEN=$'\033[32m'     C_YELLOW=$'\033[33m'
+    C_CYAN=$'\033[36m'      C_BOLD_RED=$'\033[1;31m'
 }
 
 # Colour for a log level / summary status word.
@@ -142,6 +141,7 @@ fi
 # ---------------------------------------------------------------- discovery
 search_json="[]"
 for author in "${AUTHORS[@]}"; do
+    # shellcheck disable=SC2054  # the comma is part of the gh --json field list
     args=(search prs --owner "$OWNER" --state open --archived=false --limit "$LIMIT"
           --json repository,number,title,url)
     [[ "$author" == "any" ]] || args+=(--author "$author")
@@ -257,7 +257,7 @@ for row in "${PRS[@]}"; do
     # Re-read PR state right before acting. mergeable can be UNKNOWN while
     # GitHub recomputes it (e.g. just after a sibling PR was merged).
     pr=""
-    for attempt in 1 2 3 4 5; do
+    for _ in 1 2 3 4 5; do
         pr=$(gh pr view "$number" -R "$repo" --json \
             state,isDraft,mergeable,mergeStateStatus,reviewDecision,headRefName,headRefOid,isCrossRepository,statusCheckRollup) \
             || { pr=""; break; }
