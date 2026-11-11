@@ -19,6 +19,8 @@ KEEP_BRANCH=0
 DEBUG=0
 COLOR=auto
 ALLOW_NO_CHECKS=0
+APPROVE=0
+APPROVE_BODY=""
 LIMIT=300
 MERGE_DELAY=2
 
@@ -47,11 +49,17 @@ Options:
                           terminal and NO_COLOR is unset)
       --no-color          Disable coloured output
       --allow-no-checks   Treat PRs that have no checks at all as passing
+      --approve           Approve PRs that are waiting for a review (REVIEW_REQUIRED)
+                          once every other gate (incl. CI) has passed, then merge.
+                          The approval is pinned to the checked head commit. You
+                          cannot approve your own PRs. Off by default.
+      --approve-body TEXT Review comment submitted with --approve (default: none)
   -l, --limit N           Max PRs fetched from search (default: 300)
   -h, --help              Show this help
 
 A PR is merged only if: open, not draft, no merge conflicts, not blocked by
-branch protection / required reviews, and every check has completed successfully.
+branch protection / required reviews (unless --approve satisfies them), and
+every check has completed successfully.
 PRs whose CI is still pending are skipped (and logged) - re-run later.
 PRs that are merely BEHIND the base branch are still merged; they only need a
 rebase if GitHub reports conflicts.
@@ -109,6 +117,8 @@ while [[ $# -gt 0 ]]; do
         --color)           COLOR=always; shift ;;
         --no-color)        COLOR=never; shift ;;
         --allow-no-checks) ALLOW_NO_CHECKS=1; shift ;;
+        --approve)         APPROVE=1; shift ;;
+        --approve-body)    APPROVE_BODY="${2:?missing value for $1}"; shift 2 ;;
         -h|--help)         usage; exit 0 ;;
         *) usage >&2; die "Unknown option: $1" ;;
     esac
@@ -119,6 +129,11 @@ init_colors
 case "$METHOD" in auto|rebase|merge|squash) ;; *) die "Invalid --method: $METHOD" ;; esac
 [[ "$LIMIT" =~ ^[0-9]+$ ]] || die "--limit must be a number"
 [[ ${#AUTHORS[@]} -gt 0 ]] || AUTHORS=("app/dependabot")
+if [[ $APPROVE -eq 1 ]]; then
+    for a in "${AUTHORS[@]}"; do
+        [[ "$a" != "any" ]] || log WARN "--approve combined with --author any: PRs from ANY author may be approved"
+    done
+fi
 
 # ---------------------------------------------------------------- preflight
 command -v gh >/dev/null || die "gh not found"
@@ -133,7 +148,11 @@ if ! gh auth status 2>&1 | grep -E "Token scopes:" | grep -q "'workflow'"; then
 fi
 
 if [[ $EXECUTE -eq 1 ]]; then
-    log INFO "MODE: EXECUTE (PRs will be merged)"
+    if [[ $APPROVE -eq 1 ]]; then
+        log INFO "MODE: EXECUTE (PRs will be merged; review-required PRs will be approved)"
+    else
+        log INFO "MODE: EXECUTE (PRs will be merged)"
+    fi
 else
     log INFO "MODE: DRY-RUN (no changes; use --execute to merge)"
 fi
@@ -223,7 +242,7 @@ ci_problems() {
       ] | join(", ")' <<<"$1"
 }
 
-MERGED=0 SKIPPED=0 FAILED=0 WOULD=0
+MERGED=0 SKIPPED=0 FAILED=0 WOULD=0 APPROVED=0
 declare -a SUMMARY
 
 # Summary line: status, PR ref, PR title (the loop's $title), plus optional reason.
@@ -288,8 +307,12 @@ for row in "${PRS[@]}"; do
     if [[ "$mergeable" != "MERGEABLE" ]]; then
         skip "$ref" "mergeable=$mergeable (state $mstate)"; continue
     fi
+    need_approval=0
     case "$review" in
-        CHANGES_REQUESTED|REVIEW_REQUIRED) skip "$ref" "review decision: $review"; continue ;;
+        CHANGES_REQUESTED) skip "$ref" "review decision: $review"; continue ;;
+        REVIEW_REQUIRED)
+            if [[ $APPROVE -eq 1 ]]; then need_approval=1
+            else skip "$ref" "review decision: $review (use --approve to approve)"; continue; fi ;;
     esac
 
     # CI gate.
@@ -307,12 +330,14 @@ for row in "${PRS[@]}"; do
     esac
 
     # BLOCKED here means branch protection requirements beyond what we can see.
-    if [[ "$mstate" == "BLOCKED" ]]; then
+    # When we are about to approve, BLOCKED is expected and re-checked afterwards.
+    if [[ "$mstate" == "BLOCKED" && $need_approval -eq 0 ]]; then
         skip "$ref" "blocked by branch protection (CI ok, state BLOCKED)"; continue
     fi
 
     note=""
     [[ "$mstate" == "BEHIND" ]] && note=" (behind base, no conflicts)"
+    [[ $need_approval -eq 0 ]] || note="$note (after approving)"
 
     if [[ $DEBUG -eq 1 ]]; then
         log DEBUG "$ref - head=${sha:0:8} mergeable=$mergeable state=$mstate review='${review:-none}' ci=$ci method=$method"
@@ -325,15 +350,43 @@ for row in "${PRS[@]}"; do
 
     if [[ $EXECUTE -eq 0 ]]; then
         WOULD=$((WOULD + 1))
+        [[ $need_approval -eq 0 ]] || log DRY "WOULD APPROVE $ref at ${sha:0:8}"
         log DRY "WOULD MERGE $ref via $method$note; would delete branch $branch"
         record WOULD "$ref"
         continue
     fi
 
+    # Approve (pinned to the head commit we validated), then wait for GitHub to
+    # recompute the merge state before the BLOCKED check.
+    if [[ $need_approval -eq 1 ]]; then
+        rargs=(-X POST "repos/$repo/pulls/$number/reviews" -f event=APPROVE -f commit_id="$sha")
+        [[ -z "$APPROVE_BODY" ]] || rargs+=(-f body="$APPROVE_BODY")
+        if ! out=$(gh api "${rargs[@]}" 2>&1); then
+            if [[ "$out" == *"your own pull request"* ]]; then
+                skip "$ref" "cannot approve your own PR"
+            else
+                FAILED=$((FAILED + 1))
+                log ERROR "$ref approve failed: ${out//$'\n'/ }"
+                record FAILED "$ref" "approve failed: ${out//$'\n'/ }"
+            fi
+            continue
+        fi
+        APPROVED=$((APPROVED + 1))
+        log OK "APPROVED $ref at ${sha:0:8}"
+        for _ in 1 2 3 4 5; do
+            mstate=$(gh pr view "$number" -R "$repo" --json mergeStateStatus --jq .mergeStateStatus) || mstate=""
+            [[ "$mstate" != "BLOCKED" && "$mstate" != "UNKNOWN" && -n "$mstate" ]] && break
+            sleep 2
+        done
+        if [[ "$mstate" == "BLOCKED" || -z "$mstate" ]]; then
+            skip "$ref" "still blocked after approval (more reviews or branch protection required)"; continue
+        fi
+    fi
+
     if out=$(gh pr merge "$number" -R "$repo" "--$method" --match-head-commit "$sha" 2>&1); then
         MERGED=$((MERGED + 1))
         log OK "MERGED $ref via $method$note"
-        record MERGED "$ref"
+        if [[ $need_approval -eq 1 ]]; then record MERGED "$ref" "approved"; else record MERGED "$ref"; fi
     else
         FAILED=$((FAILED + 1))
         log ERROR "$ref merge failed: ${out//$'\n'/ }"
@@ -370,7 +423,7 @@ log INFO "Summary"
 printf '%s\n' "${SUMMARY[@]}"
 echo
 if [[ $EXECUTE -eq 1 ]]; then
-    log INFO "merged=$MERGED skipped=$SKIPPED failed=$FAILED"
+    log INFO "merged=$MERGED approved=$APPROVED skipped=$SKIPPED failed=$FAILED"
 else
     log INFO "DRY-RUN: would_merge=$WOULD skipped=$SKIPPED failed=$FAILED (re-run with --execute to merge)"
 fi
