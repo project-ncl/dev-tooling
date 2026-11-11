@@ -43,6 +43,9 @@ gh auth refresh -h github.com -s workflow
 
 # Include PRs from any author, not just Dependabot
 ./merge-prs.sh -p 'shared-github-actions' -a any
+
+# Approve PRs that are waiting for a review, then merge them
+./merge-prs.sh -p 'shared-github-actions' --approve --execute
 ```
 
 ### Options
@@ -60,6 +63,8 @@ gh auth refresh -h github.com -s workflow
 | `-d, --debug` | Verbose per-PR output (head SHA, mergeable state, review, CI, method, workflow files touched). |
 | `--color` / `--no-color` | Force or disable coloured output. Default: colour only on a terminal and when `NO_COLOR` is unset. |
 | `--allow-no-checks` | Treat PRs with no checks at all as passing. |
+| `--approve` | Approve PRs that are waiting for a review (`REVIEW_REQUIRED`) once every other check has passed, then merge them. Off by default. |
+| `--approve-body TEXT` | Comment submitted with the approval. Default: none. |
 | `-l, --limit N` | Maximum PRs fetched from search (default: 300). |
 | `-h, --help` | Show help. |
 
@@ -69,12 +74,19 @@ A PR is merged only if it is:
 
 - open and not a draft
 - free of merge conflicts
-- not blocked by branch protection or required reviews
+- not blocked by branch protection or required reviews (unless `--approve`
+  satisfies them)
 - passing on every check
 
 Otherwise it is skipped and the reason is logged. Notes:
 
 - PRs whose CI is still **pending** are skipped. Re-run the script later.
+- With `--approve`, a PR that needs a review is approved only after it passes
+  every other check. The approval is pinned to the checked head commit. PRs with
+  requested changes are never approved. Your own PRs are skipped, because GitHub
+  does not allow self-approval. A PR that is still blocked after approval (for
+  example, because two reviewers are required) is skipped.
+  Combining `--approve` with `-a any` prints a warning.
 - PRs that are merely **behind** the base branch are still merged. They only
   need a rebase if GitHub reports conflicts.
 - Each merge is pinned to the head commit that was checked
@@ -87,7 +99,7 @@ A summary of every PR and its outcome is printed at the end.
 | Code | Meaning |
 |------|---------|
 | `0` | Success (including a dry run, and runs where PRs were skipped). |
-| `1` | At least one merge attempt failed. |
+| `1` | At least one merge or approval attempt failed. |
 | `2` | Usage or setup error (bad option, missing `gh`/`jq`, not authenticated). |
 
 ## License
